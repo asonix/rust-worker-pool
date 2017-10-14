@@ -1,0 +1,12 @@
+[package]
+name = "worker-pool"
+version = "0.1.0"
+authors = ["Riley Trautman <asonix.dev@gmail.com>"]
+
+[dependencies]
+fibers = "0.1"
+futures = "0.1"
+handy_async = "0.2"
+serde = "1.0"
+serde_json = "1.0"
+serde_derive = "1.0"
