@@ -1,24 +1,23 @@
 extern crate worker_pool;
 
+extern crate fibers;
 extern crate serde;
 extern crate serde_json;
-extern crate fibers;
 extern crate futures;
-extern crate handy_async;
+extern crate hyper;
 
-use std::io;
-use fibers::{Spawn, Executor, ThreadPoolExecutor};
-use fibers::executor::ThreadPoolExecutorHandle;
-use fibers::net::TcpListener;
+use std::fmt::Debug;
 use futures::{Future, Sink, Stream};
-use handy_async::io::{AsyncWrite, ReadFrom};
-use handy_async::pattern::AllowPartial;
+use futures::sync::mpsc;
+use fibers::fiber::Spawn;
+use hyper::server::{Http, Request, Response, Service};
+use hyper::{Chunk, Method, StatusCode};
 
 #[derive(Debug)]
-struct OneHandler;
+pub struct OneHandler;
 
 impl worker_pool::Handler<i32> for OneHandler {
-    fn handle_present(&self, h: ThreadPoolExecutorHandle, msg: &i32) -> Result<(), ()> {
+    fn handle_present(&self, h: worker_pool::ExecHandle, msg: &i32) -> Result<(), ()> {
         let msg = *msg;
         h.spawn(futures::lazy(move || {
             println!("Got a value: {}", msg);
@@ -28,7 +27,7 @@ impl worker_pool::Handler<i32> for OneHandler {
         Ok(()) as Result<(), ()>
     }
 
-    fn handle_missing(&self, h: ThreadPoolExecutorHandle) -> Result<(), ()> {
+    fn handle_missing(&self, h: worker_pool::ExecHandle) -> Result<(), ()> {
         h.spawn(futures::lazy(move || {
             println!("Got nothing!");
             Ok(()) as Result<(), ()>
@@ -38,103 +37,79 @@ impl worker_pool::Handler<i32> for OneHandler {
     }
 }
 
-static ONE_HANDLER: OneHandler = OneHandler {};
+pub static ONE_HANDLER: OneHandler = OneHandler {};
+
+#[derive(Debug)]
+struct HelloWorld<T>
+where
+    T: Send + Sync + Clone + Debug,
+{
+    sender: mpsc::Sender<worker_pool::Message<T>>,
+}
+
+impl<T> HelloWorld<T>
+where
+    T: Send + Sync + Clone + Debug,
+{
+    pub fn new(sender: mpsc::Sender<worker_pool::Message<T>>) -> Self {
+        HelloWorld { sender }
+    }
+
+    pub fn sender(&self) -> mpsc::Sender<worker_pool::Message<T>> {
+        self.sender.clone()
+    }
+}
+
+impl<T> Service for HelloWorld<T>
+where
+    T: 'static + Send + Sync + Clone + Debug + serde::de::DeserializeOwned,
+{
+    type Request = Request;
+    type Response = Response;
+    type Error = hyper::Error;
+    type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
+
+    fn call(&self, req: Request) -> Self::Future {
+        let sender = self.sender();
+
+        match (req.method(), req.path()) {
+            (&Method::Post, "/") => {
+                Box::new(req.body().concat2().map(|chunk: Chunk| {
+                    let res: Result<worker_pool::Message<T>, _> = serde_json::from_slice(&chunk);
+
+                    if let Ok(msg) = res {
+                        sender.send(msg).wait().expect("Failed to send");
+                    }
+
+                    Response::new().with_body("Hewwo???\n")
+                }))
+            }
+            _ => {
+                Box::new(futures::future::ok(
+                    Response::new().with_status(StatusCode::NotFound),
+                ))
+            }
+        }
+    }
+}
 
 fn main() {
+    let addr = "127.0.0.1:3000".parse().expect(
+        "Failed to parse server addr",
+    );
     let mut config = worker_pool::Config::new();
     config.register_handler("one", &ONE_HANDLER).expect(
         "Failed to register handler",
     );
-    let handles = worker_pool::run(config);
 
+    let handles = worker_pool::run(config);
     let sender = handles.sender();
 
-    let server_addr = "127.0.0.1:3000".parse().expect("Invalid TCP bind address");
+    let server = Http::new()
+        .bind(&addr, move || Ok(HelloWorld::new(sender.clone())))
+        .expect("Failed to create server");
+    server.run().expect("Failed to start server");
 
-    let mut executor = ThreadPoolExecutor::new().expect("Cannot create Executor");
-    let handle0 = executor.handle();
-    let monitor = executor.spawn_monitor(TcpListener::bind(server_addr).and_then(move |listener| {
-        println!("# Start listening: {}: ", server_addr);
-
-        // Creates a stream of incoming TCP client sockets
-        listener.incoming().for_each(move |(client, addr)| {
-            // New client is connected.
-            println!("# CONNECTED: {}", addr);
-            let handle1 = handle0.clone();
-
-            let sender1 = sender.clone();
-
-            // Spawns a fiber to handle the client.
-            handle0.spawn(
-                client
-                    .and_then(move |client| {
-                        // For simplicity, splits reading process and
-                        // writing process into differrent fibers.
-                        let (reader, writer) = (client.clone(), client);
-                        let (tx, rx) = fibers::sync::mpsc::channel();
-
-                        // let handle2 = handle1.clone();
-                        let sender2 = sender1.clone();
-
-                        // Spawns a fiber for the writer side.
-                        // When a message is arrived in `rx`,
-                        // this fiber sends it back to the client.
-                        handle1.spawn(
-                            rx.map_err(|_| -> io::Error { unreachable!() })
-                                .fold(writer, move |writer, buf: Vec<u8>| {
-                                    let buf2 = buf.clone();
-
-                                    if let Ok(value) = String::from_utf8(buf) {
-                                        let values = value.split("\r\n\r\n");
-                                        for v in values {
-                                            println!("JSON: {}", &v);
-                                            if let Ok(message) = serde_json::from_str(&v) {
-                                                if let Err(err) = sender2
-                                                    .clone()
-                                                    .send(message)
-                                                    .wait()
-                                                {
-                                                    println!("Result: {}", err);
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    println!("# SEND: {} bytes", buf2.len());
-                                    writer.async_write_all(buf2).map(|(w, _)| w).map_err(|e| {
-                                        e.into_error()
-                                    })
-                                })
-                                .then(|r| {
-                                    println!("# Writer finished: {:?}", r);
-                                    Ok(())
-                                }),
-                        );
-
-                        // The reader side is executed in the current fiber.
-                        let stream = vec![0; 1024].allow_partial().into_stream(reader);
-                        stream.map_err(|e| e.into_error()).fold(
-                            tx,
-                            |tx, (mut buf, len)| {
-                                buf.truncate(len);
-                                println!("# RECV: {} bytes", buf.len());
-
-                                // Sends received  to the writer half.
-                                tx.send(buf).expect("Cannot send");
-                                Ok(tx) as io::Result<_>
-                            },
-                        )
-                    })
-                    .then(|r| {
-                        println!("# Client finished: {:?}", r);
-                        Ok(())
-                    }),
-            );
-            Ok(())
-        })
-    }));
-    let result = executor.run_fiber(monitor).expect("Execution failed");
-    println!("# Listener finished: {:?}", result);
-
-    handles.join().expect("Failed to wait on thread");
+    let result = handles.join();
+    println!("Manager Thread Closed: {:?}", result);
 }

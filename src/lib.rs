@@ -14,19 +14,21 @@ use fibers::executor::{ThreadPoolExecutor, ThreadPoolExecutorHandle};
 use futures::sync::mpsc;
 use futures::{Future, Sink, Stream};
 
+pub use fibers::executor::ThreadPoolExecutorHandle as ExecHandle;
+
 pub static EXIT_STR: &'static str = "exit";
 
 #[derive(Debug, Clone)]
 pub struct Config<'a, T>
 where
-    T: 'a + Debug + Clone,
+    T: 'a + Debug + Clone + serde::de::DeserializeOwned,
 {
     handlers: HashMap<&'a str, &'a Handler<T>>,
 }
 
 impl<'a, T> Default for Config<'a, T>
 where
-    T: 'a + Debug + Clone,
+    T: 'a + Debug + Clone + serde::de::DeserializeOwned,
 {
     fn default() -> Self {
         Config { handlers: HashMap::new() }
@@ -35,7 +37,7 @@ where
 
 impl<'a, T> Config<'a, T>
 where
-    T: 'a + Debug + Clone,
+    T: 'a + Debug + Clone + serde::de::DeserializeOwned,
 {
     pub fn new() -> Self {
         Default::default()
@@ -76,13 +78,19 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message<T: Debug + Clone> {
+pub struct Message<T>
+where
+    T: Debug + Clone,
+{
     name: String,
     message: Option<T>,
     retries: i32,
 }
 
-impl<T: Debug + Clone> Message<T> {
+impl<T> Message<T>
+where
+    T: Debug + Clone,
+{
     pub fn new(name: String, message: Option<T>) -> Message<T> {
         Message::<T> {
             name: name,
@@ -118,8 +126,9 @@ pub fn manager_thread<T>(
     msg_receiver: mpsc::Receiver<Message<T>>,
 ) -> thread::JoinHandle<()>
 where
-    T: 'static + Send + Sync + Clone + Debug,
+    T: 'static + Send + Sync + Clone + Debug + serde::de::DeserializeOwned,
 {
+    println!("Creating Manager Thread");
     let mut executor = ThreadPoolExecutor::new().expect("Failed to create executor");
     let exec_handle = executor.handle();
 
@@ -155,9 +164,10 @@ where
     })
 }
 
+#[derive(Debug)]
 pub struct Handles<T>
 where
-    T: Send + Sync + Clone + Debug,
+    T: Send + Sync + Clone + Debug + serde::de::DeserializeOwned,
 {
     msg_sender: mpsc::Sender<Message<T>>,
     manager_thread: thread::JoinHandle<()>,
@@ -165,7 +175,7 @@ where
 
 impl<T> Handles<T>
 where
-    T: Send + Sync + Clone + Debug,
+    T: Send + Sync + Clone + Debug + serde::de::DeserializeOwned,
 {
     pub fn new(
         msg_sender: mpsc::Sender<Message<T>>,
@@ -188,7 +198,7 @@ where
 
 pub fn run<T>(config: Config<'static, T>) -> Handles<T>
 where
-    T: 'static + Send + Sync + Clone + Debug,
+    T: 'static + Send + Sync + Clone + Debug + serde::de::DeserializeOwned,
 {
     let (tx, rx) = mpsc::channel::<Message<T>>(1000);
 

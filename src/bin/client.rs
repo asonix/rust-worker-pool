@@ -1,61 +1,50 @@
 extern crate worker_pool;
 
-extern crate fibers;
-extern crate futures;
-extern crate handy_async;
-
 extern crate serde;
 extern crate serde_json;
+extern crate hyper;
+extern crate futures;
+extern crate tokio_core;
 
-use fibers::{Spawn, Executor, InPlaceExecutor};
-use fibers::net::TcpStream;
+use std::io::{self, Write};
 use futures::{Future, Stream};
-use handy_async::io::{AsyncWrite, ReadFrom};
-use handy_async::pattern::AllowPartial;
+use hyper::{Client, Method, Request};
+use hyper::header::{ContentLength, ContentType};
+use tokio_core::reactor::Core;
+
+fn make_request(value: i32, uri: hyper::Uri) -> Request {
+    let mut req = Request::new(Method::Post, uri);
+    req.headers_mut().set(ContentType::json());
+    let msg = worker_pool::Message::new("one".to_owned(), Some(value));
+
+    let msg_str = serde_json::to_string(&msg).expect("Failed to serialize JSON");
+
+    req.headers_mut().set(ContentLength(msg_str.len() as u64));
+    req.set_body(msg_str);
+
+    req
+}
 
 fn main() {
-    let server_addr = "127.0.0.1:3000".parse().expect(
-        "Failed to parse server addr",
+    let mut core = Core::new().expect("Failed to create core");
+    let client = Client::new(&core.handle());
+
+    let uri: hyper::Uri = "http://127.0.0.1:3000".parse().expect(
+        "Failed to parse URI",
     );
 
-    // `InPlaceExecutor` is suitable to execute a few fibers.
-    // It does not create any background threads,
-    // so the overhead to manage fibers is lower than `ThreadPoolExecutor`.
-    let mut executor = InPlaceExecutor::new().expect("Cannot create Executor");
-    let handle = executor.handle();
+    let requests = futures::future::join_all((0..300).map(|value| {
+        let req = make_request(value, uri.clone());
 
-    // Spawns a fiber for echo client.
-    let monitor = executor.spawn_monitor(TcpStream::connect(server_addr).and_then(move |stream| {
-        println!("# CONNECTED: {}", server_addr);
-        let (reader, writer) = (stream.clone(), stream);
-
-        handle.spawn(futures::lazy(move || {
-            for value in 0..10000 {
-                let msg = worker_pool::Message::new("one".to_owned(), Some(value));
-                let mut buf: String =
-                    serde_json::to_string(&msg).expect("Failed to serialize message");
-
-                buf.push_str("\r\n\r\n");
-
-                writer.clone().async_write_all(buf).wait().expect(
-                    "Failed to write messsage",
-                );
-            }
-            Ok(())
-        }));
-
-        // Reader: It outputs data received from the server to the standard output stream.
-        let stream = vec![0; 256].allow_partial().into_stream(reader);
-        stream.map_err(|e| e.into_error()).for_each(
-            |(mut buf, len)| {
-                buf.truncate(len);
-                println!("{}", String::from_utf8(buf).expect("Invalid UTF-8"));
-                Ok(())
-            },
-        )
+        client.request(req).and_then(|res| {
+            res.body().for_each(|chunk| {
+                io::stdout().write_all(&chunk).map(|_| ()).map_err(
+                    From::from,
+                )
+            })
+        })
     }));
 
-    // Runs until the above fiber is terminated (i.e., The TCP stream is disconnected).
-    let result = executor.run_fiber(monitor).expect("Execution failed");
-    println!("# Disconnected: {:?}", result);
+    let res = core.run(requests);
+    println!("Result: {:?}", res);
 }
